@@ -1203,29 +1203,83 @@ const GDRIVE_FOLDERS = {
   u2025: '1XbKgR7bJsp09yvtl3ydvaZ7jrJNpdLj9'
 };
 
+// ── Retry helper ──
+async function fetchWithRetry(url, options = {}, retries = 3, delayMs = 1500) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+      // 429 = rate limit, 5xx = server error → retry
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        const wait = delayMs * attempt;
+        console.warn(`Attempt ${attempt} failed (${res.status}), retrying in ${wait}ms...`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw new Error(`HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const wait = delayMs * attempt;
+      console.warn(`Attempt ${attempt} network error, retrying in ${wait}ms...`, err.message);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+
 // ── List all Excel files in a folder ──
 async function listFolderFiles(folderId) {
   const q = encodeURIComponent(`'${folderId}' in parents and trashed=false and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'`);
   const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&key=${GDRIVE_API_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Drive API error ${res.status}: ${await res.text()}`);
+  const res = await fetchWithRetry(url);
   const data = await res.json();
   return data.files || [];
 }
 
-// ── Download a single file as ArrayBuffer ──
-async function downloadFile(fileId) {
+// ── Download a single file as ArrayBuffer (with content validation + retry on bad payload) ──
+async function downloadFile(fileId, fileName, expectedMinBytes = 1000) {
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download error ${res.status} for file ${fileId}`);
-  return await res.arrayBuffer();
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetchWithRetry(url);
+      const buf = await res.arrayBuffer();
+      // A valid xlsx is a zip archive — must start with PK signature (0x50 0x4B) and have reasonable size
+      const view = new Uint8Array(buf.slice(0, 2));
+      const isZipSignature = buf.byteLength > expectedMinBytes && view[0] === 0x50 && view[1] === 0x4B;
+      if (!isZipSignature) {
+        throw new Error(`Payload không hợp lệ cho file "${fileName}" (size=${buf.byteLength}, không phải file xlsx hợp lệ)`);
+      }
+      return buf;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`downloadFile attempt ${attempt}/${maxAttempts} failed for "${fileName}":`, err.message);
+      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+  }
+  throw new Error(`Không thể tải file "${fileName}" sau ${maxAttempts} lần thử: ${lastErr.message}`);
 }
 
 // ── Parse ArrayBuffer with SheetJS ──
-function parseXlsx(buffer) {
-  const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+function parseXlsx(buffer, fileName) {
+  if (!buffer || buffer.byteLength === 0) {
+    throw new Error(`File "${fileName}" tải về trống (0 bytes) — có thể do lỗi mạng/quota.`);
+  }
+  let wb;
+  try {
+    wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+  } catch (e) {
+    throw new Error(`File "${fileName}" không parse được (${e.message}). Buffer size: ${buffer.byteLength} bytes.`);
+  }
+  if (!wb.SheetNames || wb.SheetNames.length === 0) {
+    throw new Error(`File "${fileName}" không có sheet nào — file có thể bị lỗi/hỏng.`);
+  }
   const ws = wb.Sheets[wb.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(ws, { defval: null });
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+  if (rows.length === 0) {
+    console.warn(`⚠️ File "${fileName}" parse ra 0 dòng — kiểm tra lại file gốc.`);
+  }
+  return rows;
 }
 
 // ── Load all files in folder, parse and dedup ──
@@ -1240,10 +1294,21 @@ async function loadFolder(folderId, dedupFn, labelId, countId) {
       return [];
     }
     let all = [];
-    for (const f of files) {
-      const buf = await downloadFile(f.id);
-      const rows = parseXlsx(buf);
-      all = all.concat(rows);
+    const failedFiles = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      if (i > 0) await new Promise(r => setTimeout(r, 300)); // small delay between files
+      try {
+        const buf = await downloadFile(f.id, f.name);
+        const rows = parseXlsx(buf, f.name);
+        all = all.concat(rows);
+      } catch (fileErr) {
+        console.error(`❌ Bỏ qua file "${f.name}" do lỗi:`, fileErr.message);
+        failedFiles.push(f.name);
+      }
+    }
+    if (failedFiles.length > 0) {
+      throw new Error(`${failedFiles.length}/${files.length} file không tải được: ${failedFiles.join(', ')}. Vui lòng bấm Refresh Data để thử lại.`);
     }
     const deduped = dedupFn ? dedupFn(all) : all;
     badge.className = 'source-badge loaded';
@@ -1305,7 +1370,12 @@ async function fetchAndRender() {
     const pill = document.getElementById('status-pill');
     pill.textContent = 'Lỗi kết nối';
     pill.classList.remove('loaded');
-    alert('Lỗi tải dữ liệu: ' + err.message + '\n\nKiểm tra:\n1. API Key đã được bỏ restriction chưa?\n2. Folder đã được share "Anyone with link" chưa?');
+    // Check if it's a transient error
+    const isTransient = err.message.includes('fetch') || err.message.includes('network') || err.message.includes('429') || err.message.includes('500');
+    const hint = isTransient
+      ? 'Lỗi kết nối tạm thời. Vui lòng bấm "Refresh Data" để thử lại.'
+      : 'Kiểm tra:\n1. API Key đã được bỏ restriction chưa?\n2. Folder đã được share "Anyone with link" chưa?';
+    alert('Lỗi tải dữ liệu: ' + err.message + '\n\n' + hint);
     console.error(err);
   } finally {
     loadingEl.classList.remove('show');
