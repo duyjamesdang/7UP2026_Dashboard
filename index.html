@@ -543,7 +543,7 @@
   // GOOGLE DRIVE FOLDER CONFIG (folder public, no auth needed)
   // =============================================================
   var DRIVE_FOLDER_ID = '1wzmc6SiFeZev-W6jX5jZAUAJm8DkhzTW';
-  var DRIVE_AUTO_LOAD = false; // bật lên true nếu muốn tự load khi mở trang
+  var DRIVE_AUTO_LOAD = true; // bật lên true nếu muốn tự load khi mở trang
   // File name matching patterns -> map sang loại data
   var DRIVE_NAME_MAP = [
     { type: 'utc',      patterns: ['utc-code-histories', 'utc_code', 'utc-code'] },
@@ -664,7 +664,7 @@
 
   // ---------- Google Drive sync (folder-based) ----------
   function getApiKey(){
-    return (document.getElementById('drive-api-key-input') || {}).value || '';
+    return 'AIzaSyDGEiENI5QfSYiXqYfriEVq3mkefcuExvg';
   }
   function mapFilenameToType(name){
     var lower = name.toLowerCase();
