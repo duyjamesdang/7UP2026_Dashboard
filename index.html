@@ -689,7 +689,7 @@
     return data.files || [];
   }
   async function fetchDriveFile(fileId, apiKey){
-    var url = 'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media&key=' + apiKey;
+    var url = 'https://docs.google.com/uc?export=download&id=' + fileId;
     var res = await fetch(url);
     if (!res.ok) throw new Error('Lỗi tải file (HTTP ' + res.status + ')');
     var buf = await res.arrayBuffer();
